@@ -1,6 +1,7 @@
 mod app;
 mod egui_tools;
 mod app_renderer;
+mod mandelbrot;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 

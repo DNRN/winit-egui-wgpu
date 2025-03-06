@@ -1,6 +1,6 @@
 use crate::app_renderer::AppRenderer;
 use crate::egui_tools::EguiRenderer;
-use egui_wgpu::wgpu::{RenderPassDescriptor, SurfaceError};
+use egui_wgpu::wgpu::{BindGroup, RenderPassDescriptor, SurfaceError};
 use egui_wgpu::{wgpu, ScreenDescriptor};
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -8,6 +8,18 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShaderUniforms {
+    // WGSL vec3<f32> needs 16-byte alignment
+    // time: f32,          // 4 bytes
+    resolution: [f32; 2], // 8 bytes (total 12)
+    mouse_pos: [f32; 2],  // 8 bytes (total 20)
+    base_color: [f32; 4], // <- Changed to vec4 in shader (16 bytes)
+    _padding: [f32; 4],
+    // Total size: 4 + 8 + 8 + 16 = 36 bytes (288 bits)
+}
 
 pub struct AppState {
     pub device: wgpu::Device,
@@ -17,7 +29,10 @@ pub struct AppState {
     pub scale_factor: f32,
     pub egui_renderer: EguiRenderer,
     pub render_pipeline: wgpu::RenderPipeline,
-    pub app_renderer: AppRenderer,
+    pub uniforms: ShaderUniforms,
+    pub bind_group: BindGroup,
+    uniform_buffer: wgpu::Buffer,
+   // pub app_renderer: AppRenderer,
 }
 
 impl AppState {
@@ -79,11 +94,45 @@ impl AppState {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("hello_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("screen_shader.wgsl").into()),
         });
+
+        // Uniform buffer
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Buffer"),
+            size: std::mem::size_of::<ShaderUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Bind group layout
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+            label: Some("uniform_bind_group_layout"),
+        });
+
+        // Bind group
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+            label: Some("uniform_bind_group"),
+        });
+
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -128,12 +177,12 @@ impl AppState {
         });
 
         // Setup AppRendere and set background "clear color"
-        let app_renderer = AppRenderer::new(wgpu::Color {
-            r: 0.1,
-            g: 0.2,
-            b: 0.3,
-            a: 1.0,
-        });
+        // let app_renderer = AppRenderer::new(wgpu::Color {
+        //     r: 0.1,
+        //     g: 0.2,
+        //     b: 0.3,
+        //     a: 1.0,
+        // });
 
         Self {
             device,
@@ -143,7 +192,16 @@ impl AppState {
             egui_renderer,
             scale_factor,
             render_pipeline,
-            app_renderer
+            uniforms: ShaderUniforms {
+                // time: 0.0,
+                resolution: [800.0, 600.0], // Initial window size
+                mouse_pos: [0.5, 0.5],     // Normalized coords
+                base_color: [0.1, 0.2, 0.3, 1.0],
+                _padding: [0.0, 0.0, 0.0, 0.0],
+            },
+            bind_group,
+            uniform_buffer
+            // app_renderer
         }
     }
 
@@ -152,12 +210,18 @@ impl AppState {
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
     }
+
+    pub fn update_uniforms(&mut self, new_uniforms: ShaderUniforms) {
+        self.uniforms = new_uniforms;
+        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniforms]));
+    }
 }
 
 pub struct App {
     instance: wgpu::Instance,
     state: Option<AppState>,
     window: Option<Arc<Window>>,
+    cursor_position: Option<(f32, f32)>,
 }
 
 impl App {
@@ -167,6 +231,7 @@ impl App {
             instance,
             state: None,
             window: None,
+            cursor_position: None
         }
     }
 
@@ -250,6 +315,17 @@ impl App {
         
         // state.app_renderer.render(&mut encoder, &surface_view);
 
+        let new_uniforms = ShaderUniforms {
+            // time: 0.0, // Implement time tracking
+            resolution: [state.surface_config.width as f32, state.surface_config.height as f32],
+            mouse_pos: [self.cursor_position.unwrap().0, self.cursor_position.unwrap().1], // Implement mouse tracking
+            base_color: [0.1, 0.2, 0.3, 1.0], // Teal: R=0, G=0.5, B=0.5,
+            _padding: [0.0, 0.0, 0.0, 0.0],
+        };
+        state.update_uniforms(new_uniforms);
+        // state.update_uniforms(&state.queue, new_uniforms);
+
+
         {
             // 1.
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -279,37 +355,55 @@ impl App {
         
             // NEW!
             render_pass.set_pipeline(&state.render_pipeline); // 2.
-            render_pass.draw(0..3, 0..1); // 3.
+            render_pass.set_bind_group(0, &state.bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+            // render_pass.draw(0..3, 0..1); // 3.
         }
 
         {
             state.egui_renderer.begin_frame(window);
 
-            egui::Window::new("winit + egui + wgpu says hello!")
-                .resizable(true)
-                .vscroll(true)
-                .default_open(false)
+            egui::Window::new("Shader Control")
                 .show(state.egui_renderer.context(), |ui| {
-                    ui.label("Label!");
-
-                    if ui.button("Button!").clicked() {
-                        println!("boom!")
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "Pixels per point: {}",
-                            state.egui_renderer.context().pixels_per_point()
-                        ));
-                        if ui.button("-").clicked() {
-                            state.scale_factor = (state.scale_factor - 0.1).max(0.3);
-                        }
-                        if ui.button("+").clicked() {
-                            state.scale_factor = (state.scale_factor + 0.1).min(3.0);
-                        }
-                    });
+                    let mut color = [
+                        state.uniforms.base_color[0],
+                        state.uniforms.base_color[1],
+                        state.uniforms.base_color[2],
+                    ];
+                    
+                    ui.color_edit_button_rgb(&mut color);
+                    // if color != [state.uniforms.base_color[0], state.uniforms.base_color[1], state.uniforms.base_color[2]] {
+                    //     let mut new_uniforms = state.uniforms;
+                    //     new_uniforms.base_color = [color[0], color[1], color[2], 1.0];
+                    //     state.update_uniforms(new_uniforms);
+                    // }
                 });
+
+            // egui::Window::new("winit + egui + wgpu says hello!")
+            //     .resizable(true)
+            //     .vscroll(true)
+            //     .default_open(false)
+            //     .show(state.egui_renderer.context(), |ui| {
+            //         ui.label("Label!");
+
+            //         if ui.button("Button!").clicked() {
+            //             println!("boom!")
+            //         }
+
+            //         ui.separator();
+            //         ui.horizontal(|ui| {
+            //             ui.label(format!(
+            //                 "Pixels per point: {}",
+            //                 state.egui_renderer.context().pixels_per_point()
+            //             ));
+            //             if ui.button("-").clicked() {
+            //                 state.scale_factor = (state.scale_factor - 0.1).max(0.3);
+            //             }
+            //             if ui.button("+").clicked() {
+            //                 state.scale_factor = (state.scale_factor + 0.1).min(3.0);
+            //             }
+            //         });
+            //     });
 
             state.egui_renderer.end_frame_and_draw(
                 &state.device,
@@ -354,6 +448,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(new_size) => {
                 self.handle_resized(new_size.width, new_size.height);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = Some((position.x as f32, position.y as f32));
             }
             _ => (),
         }
